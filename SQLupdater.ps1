@@ -1,15 +1,22 @@
 <# 
 .SYNOPSIS
-  SQL Server CU checker/installer (silent) with optional midnight scheduling + single-file i18n + interactive menu.
+  SQL Server CU updater with menu, single-file i18n, silent install, scheduling, auto task cleanup, and email notification.
 
 .DESCRIPTION
   - Detects installed SQL Server instances and build versions.
   - Fetches "Latest" CU info from Microsoft Learn build-versions pages and resolves the CU download URL.
-  - Can install silently now or schedule a silent install at next midnight (runs as SYSTEM).
-  - Includes a simple interactive menu when run without action switches.
+  - Can install silently now or schedule a silent install at a chosen date/time (default: next midnight).
+  - Scheduled run uses a generated wrapper .ps1 that:
+      1) runs the CU installer silently
+      2) sends email with result (optional)
+      3) deletes the scheduled task automatically
+      4) optionally deletes itself
 
 .PARAMETER InstallNow
   Installs latest detected CU immediately (silent).
+
+.PARAMETER ScheduleAt
+  Schedules a silent install at a specific local date/time (string parseable by Get-Date).
 
 .PARAMETER InstallAtMidnight
   Downloads latest detected CU now and schedules silent install at next midnight.
@@ -23,6 +30,30 @@
 .PARAMETER LogPath
   Path to log file.
 
+.PARAMETER SmtpServer
+  SMTP server for completion email.
+
+.PARAMETER SmtpPort
+  SMTP port (default 25).
+
+.PARAMETER SmtpUseSsl
+  Use SSL/TLS for SMTP.
+
+.PARAMETER MailFrom
+  Sender email.
+
+.PARAMETER MailTo
+  Recipient email (comma-separated allowed).
+
+.PARAMETER MailSubject
+  Subject (default set by language).
+
+.PARAMETER MailUser
+  SMTP username (optional; if not set, uses anonymous).
+
+.PARAMETER MailPassword
+  SMTP password (optional; can be plain for automation; prefer using a secret store in production).
+
 .NOTES
   Run as Administrator.
 #>
@@ -31,9 +62,20 @@
 param(
   [switch]$InstallNow,
   [switch]$InstallAtMidnight,
+  [string]$ScheduleAt,
   [switch]$Force,
   [string]$Language = "auto",
-  [string]$LogPath = "$env:ProgramData\SqlCuPatcher\SqlCuPatcher.log"
+  [string]$LogPath = "$env:ProgramData\SqlCuPatcher\SqlCuPatcher.log",
+
+  # Email (optional)
+  [string]$SmtpServer,
+  [int]$SmtpPort = 25,
+  [switch]$SmtpUseSsl,
+  [string]$MailFrom,
+  [string]$MailTo,
+  [string]$MailSubject,
+  [string]$MailUser,
+  [string]$MailPassword
 )
 
 Set-StrictMode -Version Latest
@@ -43,7 +85,7 @@ $ErrorActionPreference = "Stop"
 
 $script:I18N = @{
   "cs-CZ" = @{
-    Start              = "Start. InstallNow={0} InstallAtMidnight={1} Force={2} Language={3}"
+    Start              = "Start. InstallNow={0} InstallAtMidnight={1} ScheduleAt={2} Force={3} Language={4}"
     NeedAdmin          = "Spusť PowerShell jako Administrátor."
     NoInstances        = "Nenašel jsem žádné SQL Server instance v registru."
     FoundInstances     = "Nalezené instance: {0}"
@@ -57,10 +99,11 @@ $script:I18N = @{
     NeedsUpdateHeader  = "Instance, které vypadají, že potřebují CU:"
     NeedsUpdateLine    = "- {0} (SQL {1}) {2} -> {3} | {4}"
     UpToDate           = "Vypadá to, že všechny nalezené SQL instance jsou na Latest CU (nebo se nepodařilo porovnat buildy)."
-    DoneCheck          = "Kontrola hotová. Pro instalaci použij: -InstallNow nebo -InstallAtMidnight"
+    DoneCheck          = "Kontrola hotová."
     Downloading        = "Stahuju: {0} -> {1}"
     InstallerExists    = "Installer už existuje: {0}"
     SchedulePlanned    = "Naplánováno: {0} na {1} (běží jako SYSTEM, skrytě)."
+    WrapperWritten     = "Vytvořen wrapper skript: {0}"
     InstallStart       = "Spouštím tichou instalaci: ""{0}"" {1}"
     InstallExit        = "Instalátor skončil s ExitCode={0}"
     InstallWarn        = "Instalace vrátila ExitCode={0} (mrkni do SQL setup logů v %ProgramFiles%\Microsoft SQL Server\*\Setup Bootstrap\Log\ )."
@@ -69,24 +112,39 @@ $script:I18N = @{
     CompareFail        = "Nepodařilo se porovnat verze pro {0}: {1}"
     WUApiFail          = "Windows Update API dotaz selhal: {0}"
     DownloadFail       = "Stažení selhalo: {0}"
-    ScheduleQuestion   = "Naplánovat tichou instalaci pro SQL {0} ({1}) o půlnoci? [A/N]"
+    ScheduleQuestion   = "Naplánovat tichou instalaci pro SQL {0} ({1}) na {2}? [A/N]"
     InstallQuestion    = "Spustit tichou instalaci hned pro SQL {0} ({1})? [A/N]"
+    EmailSkipped       = "Email nenastaven – vynechávám notifikaci."
+    EmailSent          = "Email odeslán na {0}"
+    EmailFail          = "Odeslání emailu selhalo: {0}"
     MenuTitle          = "SQL Server CU Updater - Menu"
     MenuPrompt         = "Vyber volbu"
     Menu1              = "1) Kontrola (detekce instancí + latest CU)"
     Menu2              = "2) Tichá instalace hned"
-    Menu3              = "3) Naplánovat instalaci na půlnoc"
-    Menu4              = "4) Změnit jazyk"
-    Menu5              = "5) Zobrazit cesty (log/downloads)"
+    Menu3              = "3) Naplánovat instalaci (konkrétní datum/čas)"
+    Menu4              = "4) Naplánovat instalaci na půlnoc"
+    Menu5              = "5) Nastavit email (SMTP)"
+    Menu6              = "6) Změnit jazyk"
+    Menu7              = "7) Zobrazit cesty (log/downloads)"
     Menu0              = "0) Konec"
     MenuLangPrompt     = "Zadej jazyk (auto/cs-CZ/en-US nebo vlastní)"
+    MenuDatePrompt     = "Zadej datum/čas (např. 2026-02-18 02:15)"
+    MenuSmtpServer     = "SMTP server (prázdné = vypnout email)"
+    MenuSmtpPort       = "SMTP port (výchozí 25)"
+    MenuSmtpSsl        = "Použít SSL? (A/N)"
+    MenuMailFrom       = "From (odesílatel)"
+    MenuMailTo         = "To (příjemce, lze více oddělených čárkou)"
+    MenuMailUser       = "SMTP user (prázdné = bez autentizace)"
+    MenuMailPass       = "SMTP password (prázdné = bez autentizace)"
     PathsLine1         = "Log: {0}"
     PathsLine2         = "Downloads: {0}"
     PressEnter         = "Stiskni Enter pro pokračování..."
+    DefaultSubjectOk   = "SQL CU update dokončeno (OK)"
+    DefaultSubjectFail = "SQL CU update dokončeno (CHYBA)"
   }
 
   "en-US" = @{
-    Start              = "Start. InstallNow={0} InstallAtMidnight={1} Force={2} Language={3}"
+    Start              = "Start. InstallNow={0} InstallAtMidnight={1} ScheduleAt={2} Force={3} Language={4}"
     NeedAdmin          = "Run PowerShell as Administrator."
     NoInstances        = "No SQL Server instances found in registry."
     FoundInstances     = "Found instances: {0}"
@@ -100,10 +158,11 @@ $script:I18N = @{
     NeedsUpdateHeader  = "Instances that appear to need an update:"
     NeedsUpdateLine    = "- {0} (SQL {1}) {2} -> {3} | {4}"
     UpToDate           = "All detected instances appear up-to-date (or build comparison failed)."
-    DoneCheck          = "Check finished. To install, use: -InstallNow or -InstallAtMidnight"
+    DoneCheck          = "Check finished."
     Downloading        = "Downloading: {0} -> {1}"
     InstallerExists    = "Installer already exists: {0}"
     SchedulePlanned    = "Scheduled: {0} at {1} (runs as SYSTEM, hidden)."
+    WrapperWritten     = "Wrapper script written: {0}"
     InstallStart       = "Starting silent install: ""{0}"" {1}"
     InstallExit        = "Installer finished with ExitCode={0}"
     InstallWarn        = "Installer returned ExitCode={0} (check SQL setup logs in %ProgramFiles%\Microsoft SQL Server\*\Setup Bootstrap\Log\ )."
@@ -112,20 +171,35 @@ $script:I18N = @{
     CompareFail        = "Failed to compare versions for {0}: {1}"
     WUApiFail          = "Windows Update API query failed: {0}"
     DownloadFail       = "Download failed: {0}"
-    ScheduleQuestion   = "Schedule silent install for SQL {0} ({1}) at midnight? [Y/N]"
+    ScheduleQuestion   = "Schedule silent install for SQL {0} ({1}) at {2}? [Y/N]"
     InstallQuestion    = "Run silent install now for SQL {0} ({1})? [Y/N]"
+    EmailSkipped       = "Email not configured – skipping notification."
+    EmailSent          = "Email sent to {0}"
+    EmailFail          = "Email send failed: {0}"
     MenuTitle          = "SQL Server CU Updater - Menu"
     MenuPrompt         = "Choose an option"
     Menu1              = "1) Check (detect instances + latest CU)"
     Menu2              = "2) Silent install now"
-    Menu3              = "3) Schedule install at midnight"
-    Menu4              = "4) Change language"
-    Menu5              = "5) Show paths (log/downloads)"
+    Menu3              = "3) Schedule install (specific date/time)"
+    Menu4              = "4) Schedule install at midnight"
+    Menu5              = "5) Configure email (SMTP)"
+    Menu6              = "6) Change language"
+    Menu7              = "7) Show paths (log/downloads)"
     Menu0              = "0) Exit"
     MenuLangPrompt     = "Enter language (auto/cs-CZ/en-US or custom)"
+    MenuDatePrompt     = "Enter date/time (e.g. 2026-02-18 02:15)"
+    MenuSmtpServer     = "SMTP server (blank = disable email)"
+    MenuSmtpPort       = "SMTP port (default 25)"
+    MenuSmtpSsl        = "Use SSL? (Y/N)"
+    MenuMailFrom       = "From (sender)"
+    MenuMailTo         = "To (recipient, comma-separated)"
+    MenuMailUser       = "SMTP user (blank = no auth)"
+    MenuMailPass       = "SMTP password (blank = no auth)"
     PathsLine1         = "Log: {0}"
     PathsLine2         = "Downloads: {0}"
     PressEnter         = "Press Enter to continue..."
+    DefaultSubjectOk   = "SQL CU update completed (OK)"
+    DefaultSubjectFail = "SQL CU update completed (FAILED)"
   }
 }
 
@@ -371,6 +445,44 @@ function Get-PendingWindowsUpdatesSqlRelated {
   }
 }
 
+# ===================== email =====================
+
+function Send-CompletionEmail {
+  param(
+    [Parameter(Mandatory)][string]$SmtpServer,
+    [Parameter(Mandatory)][int]$SmtpPort,
+    [Parameter(Mandatory)][bool]$UseSsl,
+    [Parameter(Mandatory)][string]$From,
+    [Parameter(Mandatory)][string]$To,
+    [Parameter(Mandatory)][string]$Subject,
+    [Parameter(Mandatory)][string]$Body,
+    [string]$User,
+    [string]$Password
+  )
+
+  $msg = New-Object System.Net.Mail.MailMessage
+  $msg.From = $From
+  $To.Split(",") | ForEach-Object {
+    $addr = $_.Trim()
+    if ($addr) { [void]$msg.To.Add($addr) }
+  }
+  $msg.Subject = $Subject
+  $msg.Body = $Body
+
+  $client = New-Object System.Net.Mail.SmtpClient($SmtpServer, $SmtpPort)
+  $client.EnableSsl = $UseSsl
+
+  if ($User -and $Password) {
+    $client.Credentials = New-Object System.Net.NetworkCredential($User, $Password)
+  }
+
+  $client.Send($msg)
+}
+
+function Is-EmailConfigured {
+  return ($SmtpServer -and $MailFrom -and $MailTo)
+}
+
 # ===================== install helpers =====================
 
 function Download-File {
@@ -409,37 +521,121 @@ function Install-SqlCuSilent {
   return $p.ExitCode
 }
 
-function Schedule-InstallAtMidnight {
-  param([Parameter(Mandatory)][string]$InstallerPath)
+function Write-WrapperAndSchedule {
+  param(
+    [Parameter(Mandatory)][datetime]$RunAt,
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$TaskName,
+    [Parameter(Mandatory)][string]$LogPath
+  )
 
-  $taskName = "SQLServer-CU-Patch"
-  $midnight = (Get-Date -Hour 0 -Minute 0 -Second 0).AddDays(1)
+  $taskDir = "$env:ProgramData\SqlCuPatcher\Tasks"
+  if (!(Test-Path $taskDir)) { New-Item -ItemType Directory -Path $taskDir -Force | Out-Null }
 
-  # Build a SINGLE argument string for powershell.exe (ScheduledTasks expects a string, not string[])
+  $wrapperPath = Join-Path $taskDir "$TaskName-run.ps1"
+
+  # Wrapper script: runs installer, logs, sends email (if configured), deletes task, deletes itself
+  $useSsl = [bool]$SmtpUseSsl
+  $emailEnabled = [bool](Is-EmailConfigured)
+
+  $wrapper = @"
+`$ErrorActionPreference = 'Stop'
+
+function Add-LogLine([string]`$line) {
+  `$ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+  `$out = "[`$ts][TASK] `$line"
+  try {
+    `$dir = Split-Path -Parent '$LogPath'
+    if (!(Test-Path `$dir)) { New-Item -ItemType Directory -Path `$dir -Force | Out-Null }
+    Add-Content -Path '$LogPath' -Value `$out
+  } catch { }
+}
+
+function Send-Mail([string]`$subject, [string]`$body) {
+  if (-not $emailEnabled) { Add-LogLine 'Email not configured; skipping.'; return }
+  try {
+    `$msg = New-Object System.Net.Mail.MailMessage
+    `$msg.From = '$MailFrom'
+    foreach (`$r in ('$MailTo' -split ',')) {
+      `$a = `$r.Trim()
+      if (`$a) { [void]`$msg.To.Add(`$a) }
+    }
+    `$msg.Subject = `$subject
+    `$msg.Body = `$body
+    `$client = New-Object System.Net.Mail.SmtpClient('$SmtpServer', $SmtpPort)
+    `$client.EnableSsl = $useSsl
+    if ('$MailUser' -and '$MailPassword') {
+      `$client.Credentials = New-Object System.Net.NetworkCredential('$MailUser', '$MailPassword')
+    }
+    `$client.Send(`$msg)
+    Add-LogLine "Email sent to: $MailTo"
+  } catch {
+    Add-LogLine "Email failed: $($_.Exception.Message)"
+  }
+}
+
+`$installer = '$InstallerPath'
+`$args = "/quiet /IAcceptSQLServerLicenseTerms /Action=Patch /AllInstances /UpdateEnabled=0"
+
+Add-LogLine "Starting installer: `$installer `$args"
+`$p = Start-Process -FilePath `$installer -ArgumentList `$args -Wait -PassThru -WindowStyle Hidden
+`$code = `$p.ExitCode
+Add-LogLine "Installer finished. ExitCode=`$code"
+
+`$subjOk = "$(if ('$MailSubject') { '$MailSubject' } else { '' })"
+if (-not `$subjOk) {
+  if (`$code -eq 0) { `$subjOk = "$(L 'DefaultSubjectOk')" } else { `$subjOk = "$(L 'DefaultSubjectFail')" }
+}
+
+`$body = "Host: $env:COMPUTERNAME`r`nInstaller: `$installer`r`nExitCode: `$code`r`nLog: $LogPath`r`nTime: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Send-Mail -subject `$subjOk -body `$body
+
+# Delete the scheduled task after completion
+try {
+  schtasks /Delete /TN '$TaskName' /F | Out-Null
+  Add-LogLine "Task deleted: $TaskName"
+} catch {
+  Add-LogLine "Task delete failed: $($_.Exception.Message)"
+}
+
+# Delete wrapper script itself
+try {
+  Remove-Item -LiteralPath '$wrapperPath' -Force
+} catch { }
+"@
+
+  # NOTE: wrapper uses L() for subject defaults -> embed minimal L() there by inlining resolved strings
+  # We'll replace those placeholders now with the actual localized strings
+  $wrapper = $wrapper.Replace("$(L 'DefaultSubjectOk')", (L "DefaultSubjectOk"))
+  $wrapper = $wrapper.Replace("$(L 'DefaultSubjectFail')", (L "DefaultSubjectFail"))
+
+  Set-Content -Path $wrapperPath -Value $wrapper -Encoding UTF8 -Force
+  Write-Log (L "WrapperWritten" @($wrapperPath))
+
+  # Schedule task to run wrapper
   $psArgs = @(
     "-NoProfile",
     "-ExecutionPolicy Bypass",
     "-WindowStyle Hidden",
-    "-Command",
-    "& { `"$InstallerPath`" /quiet /IAcceptSQLServerLicenseTerms /Action=Patch /AllInstances /UpdateEnabled=0 }"
+    "-File",
+    "`"$wrapperPath`""
   ) -join " "
 
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
-  $trigger = New-ScheduledTaskTrigger -Once -At $midnight
+  $trigger = New-ScheduledTaskTrigger -Once -At $RunAt
   $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 
-  try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+  try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
 
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
-  Write-Log (L "SchedulePlanned" @($taskName, $midnight.ToString("yyyy-MM-dd HH:mm:ss")))
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
+  Write-Log (L "SchedulePlanned" @($TaskName, $RunAt.ToString("yyyy-MM-dd HH:mm:ss")))
 }
 
 # ===================== core actions =====================
 
-
 function Invoke-SqlCuCheck {
   Assert-Admin
-  Write-Log (L "Start" @($InstallNow, $InstallAtMidnight, $Force, $script:Lang))
+  Write-Log (L "Start" @($InstallNow, $InstallAtMidnight, $ScheduleAt, $Force, $script:Lang))
 
   $instances = Get-SqlInstances
   if (-not $instances -or $instances.Count -eq 0) {
@@ -518,6 +714,7 @@ function Invoke-SqlCuCheck {
     }
   }
 
+  Write-Log (L "DoneCheck")
   return [pscustomobject]@{
     Info        = $info
     NeedsUpdate = $needsUpdate
@@ -525,54 +722,78 @@ function Invoke-SqlCuCheck {
   }
 }
 
-function Invoke-SqlCuInstall {
-  param(
-    [Parameter(Mandatory)][ValidateSet("Now","Midnight")]
-    [string]$Mode
-  )
-
+function Invoke-SqlCuInstallNow {
   $result = Invoke-SqlCuCheck
-  if (-not $result.NeedsUpdate -or $result.NeedsUpdate.Count -eq 0) {
-    return
-  }
+  if (-not $result.NeedsUpdate -or $result.NeedsUpdate.Count -eq 0) { return }
 
   $targets = $result.NeedsUpdate | Sort-Object Year -Descending -Unique
-
   foreach ($t in $targets) {
     $outDir = "$env:ProgramData\SqlCuPatcher\Downloads\SQL$($t.Year)"
     $fileName = "SQL$($t.Year)-$($t.KB)-CU.exe"
     $installer = Join-Path $outDir $fileName
 
     if (!(Test-Path $installer)) {
-      if ($PSCmdlet.ShouldProcess("Download $($t.DownloadUrl)", "Download")) {
-        Download-File -Url $t.DownloadUrl -OutFile $installer
-      }
+      Download-File -Url $t.DownloadUrl -OutFile $installer
     } else {
       Write-Log (L "InstallerExists" @($installer))
     }
 
-    if ($Mode -eq "Midnight") {
-      if (-not $Force) {
-        $ans = Read-Host (L "ScheduleQuestion" @($t.Year, $t.KB))
-        if ($ans -notin @("A","a","Y","y")) { Write-Log (L "Skipped") "WARN"; continue }
-      }
-      if ($PSCmdlet.ShouldProcess("Schedule midnight install", "Schedule")) {
-        Schedule-InstallAtMidnight -InstallerPath $installer
-      }
+    if (-not $Force) {
+      $ans = Read-Host (L "InstallQuestion" @($t.Year, $t.KB))
+      if ($ans -notin @("A","a","Y","y")) { Write-Log (L "Skipped") "WARN"; continue }
     }
 
-    if ($Mode -eq "Now") {
-      if (-not $Force) {
-        $ans = Read-Host (L "InstallQuestion" @($t.Year, $t.KB))
-        if ($ans -notin @("A","a","Y","y")) { Write-Log (L "Skipped") "WARN"; continue }
+    $code = Install-SqlCuSilent -InstallerPath $installer
+    if ($code -ne 0) { Write-Log (L "InstallWarn" @($code)) "WARN" }
+
+    # Send email on completion (now-mode)
+    if (Is-EmailConfigured) {
+      try {
+        $subject = $MailSubject
+        if (-not $subject) { $subject = if ($code -eq 0) { (L "DefaultSubjectOk") } else { (L "DefaultSubjectFail") } }
+        $body = "Host: $env:COMPUTERNAME`r`nInstaller: $installer`r`nExitCode: $code`r`nLog: $LogPath`r`nTime: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+        Send-CompletionEmail -SmtpServer $SmtpServer -SmtpPort $SmtpPort -UseSsl ([bool]$SmtpUseSsl) -From $MailFrom -To $MailTo -Subject $subject -Body $body -User $MailUser -Password $MailPassword
+        Write-Log (L "EmailSent" @($MailTo))
+      } catch {
+        Write-Log (L "EmailFail" @($_.Exception.Message)) "WARN"
       }
-      if ($PSCmdlet.ShouldProcess("Install CU now", "Install")) {
-        $code = Install-SqlCuSilent -InstallerPath $installer
-        if ($code -ne 0) {
-          Write-Log (L "InstallWarn" @($code)) "WARN"
-        }
-      }
+    } else {
+      Write-Log (L "EmailSkipped") "INFO"
     }
+  }
+
+  Write-Log (L "Finished")
+}
+
+function Invoke-SqlCuSchedule {
+  param([Parameter(Mandatory)][datetime]$RunAt)
+
+  $result = Invoke-SqlCuCheck
+  if (-not $result.NeedsUpdate -or $result.NeedsUpdate.Count -eq 0) { return }
+
+  $taskName = "SQLServer-CU-Patch"
+  $targets = $result.NeedsUpdate | Sort-Object Year -Descending -Unique
+
+  # For each SQL major version present, schedule one task run; simplest approach: schedule one run that patches all instances of the targeted CU.
+  # If multiple versions exist, the last scheduled run wins under same task name. To avoid confusion, we schedule per year with distinct names.
+  foreach ($t in $targets) {
+    $outDir = "$env:ProgramData\SqlCuPatcher\Downloads\SQL$($t.Year)"
+    $fileName = "SQL$($t.Year)-$($t.KB)-CU.exe"
+    $installer = Join-Path $outDir $fileName
+
+    if (!(Test-Path $installer)) {
+      Download-File -Url $t.DownloadUrl -OutFile $installer
+    } else {
+      Write-Log (L "InstallerExists" @($installer))
+    }
+
+    $tn = "$taskName-SQL$($t.Year)"
+    if (-not $Force) {
+      $ans = Read-Host (L "ScheduleQuestion" @($t.Year, $t.KB, $RunAt.ToString("yyyy-MM-dd HH:mm:ss")))
+      if ($ans -notin @("A","a","Y","y")) { Write-Log (L "Skipped") "WARN"; continue }
+    }
+
+    Write-WrapperAndSchedule -RunAt $RunAt -InstallerPath $installer -TaskName $tn -LogPath $LogPath
   }
 
   Write-Log (L "Finished")
@@ -590,13 +811,13 @@ function Show-Menu {
   Write-Host (L "Menu3")
   Write-Host (L "Menu4")
   Write-Host (L "Menu5")
+  Write-Host (L "Menu6")
+  Write-Host (L "Menu7")
   Write-Host (L "Menu0")
   Write-Host ""
 }
 
-function Pause-Menu {
-  [void](Read-Host (L "PressEnter"))
-}
+function Pause-Menu { [void](Read-Host (L "PressEnter")) }
 
 function Set-LanguageInteractive {
   $newLang = Read-Host (L "MenuLangPrompt")
@@ -604,52 +825,83 @@ function Set-LanguageInteractive {
   $script:Lang = Resolve-Language -Language $newLang
 }
 
-# ===================== MAIN =====================
+function Configure-EmailInteractive {
+  $sv = Read-Host (L "MenuSmtpServer")
+  if ([string]::IsNullOrWhiteSpace($sv)) {
+    $script:SmtpServer = $null
+    $script:MailFrom = $null
+    $script:MailTo = $null
+    Write-Host (L "EmailSkipped")
+    return
+  }
+  $script:SmtpServer = $sv
 
-# If action switches provided, run non-interactive mode
-if ($InstallNow -or $InstallAtMidnight) {
-  Assert-Admin
-  if ($InstallAtMidnight) { Invoke-SqlCuInstall -Mode "Midnight"; exit 0 }
-  if ($InstallNow) { Invoke-SqlCuInstall -Mode "Now"; exit 0 }
+  $p = Read-Host (L "MenuSmtpPort")
+  if (-not [string]::IsNullOrWhiteSpace($p)) {
+    try { $script:SmtpPort = [int]$p } catch { }
+  }
+
+  $ssl = Read-Host (L "MenuSmtpSsl")
+  $script:SmtpUseSsl = ($ssl -in @("A","a","Y","y","1","true","True"))
+
+  $script:MailFrom = Read-Host (L "MenuMailFrom")
+  $script:MailTo   = Read-Host (L "MenuMailTo")
+  $script:MailUser = Read-Host (L "MenuMailUser")
+  $script:MailPassword = Read-Host (L "MenuMailPass")
 }
 
-# Otherwise interactive menu
+# ===================== MAIN =====================
+
+# Non-interactive modes
+if ($InstallNow) {
+  Invoke-SqlCuInstallNow
+  exit 0
+}
+
+if ($InstallAtMidnight -or $ScheduleAt) {
+  $runAt = $null
+  if ($InstallAtMidnight) {
+    $runAt = (Get-Date -Hour 0 -Minute 0 -Second 0).AddDays(1)
+  } else {
+    $runAt = Get-Date $ScheduleAt
+  }
+  Invoke-SqlCuSchedule -RunAt $runAt
+  exit 0
+}
+
+# Interactive menu
 while ($true) {
   Show-Menu
   $choice = Read-Host (L "MenuPrompt")
   switch ($choice) {
-    "1" {
-      Invoke-SqlCuCheck | Out-Null
-      Pause-Menu
-    }
-    "2" {
-      $script:Lang = $script:Lang  # keep current
-      $global:InstallNow = $true
-      $global:InstallAtMidnight = $false
-      Invoke-SqlCuInstall -Mode "Now"
-      $global:InstallNow = $false
-      Pause-Menu
-    }
+    "1" { Invoke-SqlCuCheck | Out-Null; Pause-Menu }
+    "2" { Invoke-SqlCuInstallNow; Pause-Menu }
     "3" {
-      $global:InstallNow = $false
-      $global:InstallAtMidnight = $true
-      Invoke-SqlCuInstall -Mode "Midnight"
-      $global:InstallAtMidnight = $false
+      $s = Read-Host (L "MenuDatePrompt")
+      if (-not [string]::IsNullOrWhiteSpace($s)) {
+        try {
+          $dt = Get-Date $s
+          Invoke-SqlCuSchedule -RunAt $dt
+        } catch {
+          Write-Host "Invalid date/time." 
+        }
+      }
       Pause-Menu
     }
     "4" {
-      Set-LanguageInteractive
+      $dt = (Get-Date -Hour 0 -Minute 0 -Second 0).AddDays(1)
+      Invoke-SqlCuSchedule -RunAt $dt
       Pause-Menu
     }
-    "5" {
+    "5" { Configure-EmailInteractive; Pause-Menu }
+    "6" { Set-LanguageInteractive; Pause-Menu }
+    "7" {
       $downloads = "$env:ProgramData\SqlCuPatcher\Downloads\"
       Write-Host (L "PathsLine1" @($LogPath))
       Write-Host (L "PathsLine2" @($downloads))
       Pause-Menu
     }
     "0" { break }
-    default {
-      Pause-Menu
-    }
+    default { Pause-Menu }
   }
 }
