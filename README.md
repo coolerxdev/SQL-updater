@@ -1,6 +1,6 @@
-# SQL Server CU Updater (PowerShell -- Menu Edition)
+# SQL Server CU Updater (Menu+ Edition)
 
-Interaktivní PowerShell nástroj pro kontrolu a instalaci nejnovějších
+Interaktivní PowerShell nástroj pro kontrolu, instalaci a plánování
 Cumulative Updates (CU) pro Microsoft SQL Server.
 
 Tato verze obsahuje:
@@ -11,7 +11,10 @@ Tato verze obsahuje:
 -   🌐 Online kontrolu Latest CU z Microsoft Learn
 -   ⬇️ Stažení instalačního balíčku
 -   🔕 Tichou instalaci
--   🕛 Možnost naplánování instalace na půlnoc
+-   🗓️ Plánování na konkrétní datum/čas
+-   🕛 Rychlé plánování na půlnoc
+-   🧹 Automatické smazání Scheduled Task po dokončení
+-   📧 Email notifikaci po dokončení (volitelné)
 
 ------------------------------------------------------------------------
 
@@ -22,9 +25,10 @@ Tato verze obsahuje:
 3.  Porovnání s Latest CU
 4.  Stažení CU z Microsoft Download Center
 5.  Tichá instalace (`/quiet` režim)
-6.  Naplánování instalace jako Scheduled Task (běží jako SYSTEM)
-7.  Informativní kontrola SQL-related Windows Update položek
-8.  Přepínání jazyka přímo z menu
+6.  Naplánování instalace na konkrétní datum/čas
+7.  Automatické smazání úlohy po dokončení
+8.  Email notifikace s výsledkem (ExitCode)
+9.  Přepínání jazyka přímo z menu
 
 ------------------------------------------------------------------------
 
@@ -54,16 +58,18 @@ Tato verze obsahuje:
 ### Interaktivní režim (doporučeno)
 
 ``` powershell
-.\SQLupdater.ps1
+.\SQLupdater_menu_plus.ps1
 ```
 
-Zobrazí se menu:
+Menu nabídne:
 
     1) Kontrola
     2) Tichá instalace hned
-    3) Naplánovat instalaci na půlnoc
-    4) Změnit jazyk
-    5) Zobrazit cesty
+    3) Naplánovat instalaci (konkrétní datum/čas)
+    4) Naplánovat instalaci na půlnoc
+    5) Nastavit email (SMTP)
+    6) Změnit jazyk
+    7) Zobrazit cesty
     0) Konec
 
 ------------------------------------------------------------------------
@@ -73,30 +79,75 @@ Zobrazí se menu:
 Okamžitá instalace:
 
 ``` powershell
-.\SQLupdater.ps1 -InstallNow -Force
+.\SQLupdater_menu_plus.ps1 -InstallNow -Force
 ```
 
-Naplánování instalace:
+Naplánování na konkrétní čas:
 
 ``` powershell
-.\SQLupdater.ps1 -InstallAtMidnight -Force
+.\SQLupdater_menu_plus.ps1 -ScheduleAt "2026-02-18 02:15" -Force
 ```
+
+Naplánování na půlnoc:
+
+``` powershell
+.\SQLupdater_menu_plus.ps1 -InstallAtMidnight -Force
+```
+
+------------------------------------------------------------------------
+
+## 📧 Email notifikace
+
+Email je volitelný.
+
+Lze nastavit z menu nebo pomocí parametrů:
+
+``` powershell
+.\SQLupdater_menu_plus.ps1 `
+  -ScheduleAt "2026-02-18 02:15" `
+  -SmtpServer smtp.server.local `
+  -SmtpPort 587 `
+  -SmtpUseSsl `
+  -MailFrom sql@firma.cz `
+  -MailTo admin@firma.cz `
+  -MailUser smtp_user `
+  -MailPassword heslo
+```
+
+Po dokončení instalace se odešle:
+
+-   Hostname
+-   Installer path
+-   ExitCode
+-   Čas dokončení
+-   Cesta k logu
+
+------------------------------------------------------------------------
+
+## 🧹 Automatické mazání úlohy
+
+Naplánovaná úloha:
+
+-   se spustí jako SYSTEM
+-   po dokončení se sama smaže
+-   smaže i dočasný wrapper skript
+
+Nezůstává žádná trvalá scheduled task.
 
 ------------------------------------------------------------------------
 
 ## 🌍 Jazyk
 
-Výchozí jazyk je detekován podle Windows UI.
+Automatická detekce dle Windows UI.
 
 Ruční nastavení:
 
 ``` powershell
-.\SQLupdater.ps1 -Language cs-CZ
-.\SQLupdater.ps1 -Language en-US
+.\SQLupdater_menu_plus.ps1 -Language cs-CZ
+.\SQLupdater_menu_plus.ps1 -Language en-US
 ```
 
-Přidání nového jazyka: Stačí doplnit nový blok do `$I18N` hashtable
-přímo ve skriptu.
+Nový jazyk lze přidat úpravou `$I18N` hashtable ve skriptu.
 
 ------------------------------------------------------------------------
 
@@ -110,11 +161,13 @@ Stažené aktualizace:
 
     C:\ProgramData\SqlCuPatcher\Downloads\
 
+Wrapper skripty (dočasné):
+
+    C:\ProgramData\SqlCuPatcher\Tasks\
+
 ------------------------------------------------------------------------
 
 ## 🔒 Parametry instalace
-
-Instalace probíhá pomocí:
 
     /quiet
     /IAcceptSQLServerLicenseTerms
@@ -122,7 +175,7 @@ Instalace probíhá pomocí:
     /AllInstances
     /UpdateEnabled=0
 
-Instalace běží skrytě na pozadí.
+Instalace probíhá skrytě na pozadí.
 
 ------------------------------------------------------------------------
 
@@ -140,4 +193,8 @@ Instalace běží skrytě na pozadí.
 2.  Zjištění aktuální verze
 3.  Získání Latest CU z Microsoft Learn
 4.  Stažení balíčku
-5.  Instalace nebo plánování pomocí Task Scheduler
+5.  Vytvoření wrapper skriptu
+6.  Naplánování úlohy přes Task Scheduler
+7.  Po dokončení: email + smazání úlohy + smazání wrapperu
+
+------------------------------------------------------------------------
