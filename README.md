@@ -141,15 +141,3 @@ Instalace běží skrytě na pozadí.
 3.  Získání Latest CU z Microsoft Learn
 4.  Stažení balíčku
 5.  Instalace nebo plánování pomocí Task Scheduler
-
-------------------------------------------------------------------------
-
-## 👨‍💻 Autor
-
-Interní nástroj pro automatizaci SQL Server patch managementu.
-
-------------------------------------------------------------------------
-
-## 📜 Licence
-
-Doporučeno doplnit MIT/GPL dle potřeby před veřejným publikováním.
