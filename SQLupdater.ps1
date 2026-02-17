@@ -415,14 +415,16 @@ function Schedule-InstallAtMidnight {
   $taskName = "SQLServer-CU-Patch"
   $midnight = (Get-Date -Hour 0 -Minute 0 -Second 0).AddDays(1)
 
-  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument @(
+  # Build a SINGLE argument string for powershell.exe (ScheduledTasks expects a string, not string[])
+  $psArgs = @(
     "-NoProfile",
     "-ExecutionPolicy Bypass",
     "-WindowStyle Hidden",
     "-Command",
     "& { `"$InstallerPath`" /quiet /IAcceptSQLServerLicenseTerms /Action=Patch /AllInstances /UpdateEnabled=0 }"
-  )
+  ) -join " "
 
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
   $trigger = New-ScheduledTaskTrigger -Once -At $midnight
   $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 
@@ -433,6 +435,7 @@ function Schedule-InstallAtMidnight {
 }
 
 # ===================== core actions =====================
+
 
 function Invoke-SqlCuCheck {
   Assert-Admin
